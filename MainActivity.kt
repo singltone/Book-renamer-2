@@ -60,6 +60,7 @@ data class Settings(
     val useAuthor: Boolean = true,
     val origAuthor: Boolean = false,
     val online: Boolean = false,
+    val onlineAll: Boolean = false,
     val ai: Boolean = false,
     val order: List<Part> = listOf(Part.SERIES, Part.TITLE, Part.AUTHOR),
     val sep: String = " - "
@@ -483,5 +484,4 @@ fun extractText(ctx: Context, uri: Uri, ext: String, maxChars: Int = 6000): Stri
                 while (ev != XmlPullParser.END_DOCUMENT && sb.length < maxChars) {
                     if (ev == XmlPullParser.START_TAG && p.name == "body") inBody = true
                     if (ev == XmlPullParser.TEXT && inBody) {
-                        val t = p.text.trim()
-                        if (t.i
+                        val t = p.text.tr
