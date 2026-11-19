@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -258,6 +259,176 @@ fun listFiles(ctx: Context, tree: Uri, recursive: Boolean): List<Pair<Uri, Strin
     return res
 }
 
+// ---------- Запис метаданих у файли ----------
+
+fun esc(x: String): String = x.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+fun escA(x: String): String = esc(x).replace("\"", "&quot;")
+
+fun replaceFirstWith(xml: String, re: Regex, f: (MatchResult) -> String): String {
+    val m = re.find(xml) ?: return xml
+    return xml.substring(0, m.range.first) + f(m) + xml.substring(m.range.last + 1)
+}
+
+fun insertBefore(xml: String, marker: String, snippet: String): String {
+    val i = xml.lastIndexOf(marker)
+    return if (i >= 0) xml.substring(0, i) + snippet + "\n" + xml.substring(i) else xml
+}
+
+fun setCalibre(xml: String, key: String, value: String?): String {
+    val re = Regex("<meta\\s+[^>]*name=\"" + key + "\"[^>]*/?>")
+    val tag = if (value.isNullOrBlank()) "" else "<meta name=\"" + key + "\" content=\"" + escA(value.trim()) + "\"/>"
+    return if (re.containsMatchIn(xml)) replaceFirstWith(xml, re) { tag }
+    else if (tag.isNotEmpty()) insertBefore(xml, "</metadata>", tag)
+    else xml
+}
+
+fun editOpf(xml0: String, o: Meta, m: Meta): String {
+    var xml = xml0
+    val dot = RegexOption.DOT_MATCHES_ALL
+    val t = m.title
+    if (t != o.title && !t.isNullOrBlank()) {
+        val re = Regex("(<dc:title[^>]*>)(.*?)(</dc:title>)", dot)
+        xml = if (re.containsMatchIn(xml)) replaceFirstWith(xml, re) { it.groupValues[1] + esc(t) + it.groupValues[3] }
+        else insertBefore(xml, "</metadata>", "<dc:title>" + esc(t) + "</dc:title>")
+    }
+    val a = m.author
+    if (a != o.author && !a.isNullOrBlank()) {
+        val re = Regex("<dc:creator([^>]*)>(.*?)</dc:creator>", dot)
+        xml = if (re.containsMatchIn(xml)) replaceFirstWith(xml, re) {
+            val attrs = it.groupValues[1].replace(Regex("\\s+opf:file-as=\"[^\"]*\""), "")
+            "<dc:creator" + attrs + ">" + esc(a) + "</dc:creator>"
+        } else insertBefore(xml, "</metadata>", "<dc:creator>" + esc(a) + "</dc:creator>")
+    }
+    if (m.series != o.series) xml = setCalibre(xml, "calibre:series", m.series)
+    if (m.number != o.number) xml = setCalibre(xml, "calibre:series_index", m.number)
+    return xml
+}
+
+fun writeEpub(ctx: Context, uri: Uri, o: Meta, m: Meta): Boolean {
+    val inBytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return false
+    val bos = java.io.ByteArrayOutputStream()
+    var changed = false
+    java.util.zip.ZipOutputStream(bos).use { zo ->
+        ZipInputStream(inBytes.inputStream()).use { zi ->
+            var e = zi.nextEntry
+            while (e != null) {
+                var data = zi.readBytes()
+                val name = e.name
+                if (!changed && name.endsWith(".opf", true)) {
+                    data = editOpf(data.toString(Charsets.UTF_8), o, m).toByteArray(Charsets.UTF_8)
+                    changed = true
+                }
+                val ne = java.util.zip.ZipEntry(name)
+                if (name == "mimetype") {
+                    ne.method = java.util.zip.ZipEntry.STORED
+                    ne.size = data.size.toLong()
+                    ne.compressedSize = data.size.toLong()
+                    val crc = java.util.zip.CRC32()
+                    crc.update(data)
+                    ne.crc = crc.value
+                }
+                zo.putNextEntry(ne)
+                zo.write(data)
+                zo.closeEntry()
+                e = zi.nextEntry
+            }
+        }
+    }
+    if (!changed) return false
+    ctx.contentResolver.openOutputStream(uri, "wt")?.use { it.write(bos.toByteArray()) } ?: return false
+    return true
+}
+
+fun editFb2Info(ti0: String, o: Meta, m: Meta): String {
+    var ti = ti0
+    val dot = RegexOption.DOT_MATCHES_ALL
+    val t = m.title
+    if (t != o.title && !t.isNullOrBlank()) {
+        val re = Regex("<book-title>(.*?)</book-title>", dot)
+        val tag = "<book-title>" + esc(t) + "</book-title>"
+        ti = if (re.containsMatchIn(ti)) replaceFirstWith(ti, re) { tag } else insertBefore(ti, "</title-info>", tag)
+    }
+    val a = m.author
+    if (a != o.author && !a.isNullOrBlank()) {
+        val parts = a.trim().split(Regex("\\s+"))
+        val first = parts.dropLast(1).joinToString(" ")
+        val last = parts.last()
+        val tag = "<author>" +
+            (if (first.isNotBlank()) "<first-name>" + esc(first) + "</first-name>" else "") +
+            "<last-name>" + esc(last) + "</last-name></author>"
+        val re = Regex("<author>(.*?)</author>", dot)
+        ti = if (re.containsMatchIn(ti)) replaceFirstWith(ti, re) { tag } else insertBefore(ti, "<book-title>", tag)
+    }
+    if (m.series != o.series || m.number != o.number) {
+        val sName = m.series
+        val tag = if (sName.isNullOrBlank()) "" else
+            "<sequence name=\"" + escA(sName.trim()) + "\"" +
+                (if (!m.number.isNullOrBlank()) " number=\"" + escA(m.number.trim()) + "\"" else "") + "/>"
+        val re = Regex("<sequence\\b[^>]*/>")
+        ti = if (re.containsMatchIn(ti)) replaceFirstWith(ti, re) { tag }
+        else if (tag.isNotEmpty()) insertBefore(ti, "</title-info>", tag)
+        else ti
+    }
+    return ti
+}
+
+fun writeFb2(ctx: Context, uri: Uri, o: Meta, m: Meta): Boolean {
+    val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return false
+    val head = String(bytes, 0, minOf(200, bytes.size), Charsets.ISO_8859_1)
+    val enc = Regex("encoding=[\"']([^\"']+)[\"']").find(head)?.groupValues?.get(1) ?: "UTF-8"
+    val cs = try { java.nio.charset.Charset.forName(enc) } catch (e: Exception) { Charsets.UTF_8 }
+    val text = String(bytes, cs)
+    val endTag = "</title-info>"
+    val a = text.indexOf("<title-info>")
+    val b = text.indexOf(endTag)
+    if (a < 0 || b < 0) return false
+    val ti = editFb2Info(text.substring(a, b + endTag.length), o, m)
+    val out = text.substring(0, a) + ti + text.substring(b + endTag.length)
+    ctx.contentResolver.openOutputStream(uri, "wt")?.use { it.write(out.toByteArray(cs)) } ?: return false
+    return true
+}
+
+fun writeMeta(ctx: Context, b: Book, m: Meta): Boolean = try {
+    when (b.ext) {
+        "epub" -> writeEpub(ctx, b.uri, b.meta, m)
+        "fb2" -> writeFb2(ctx, b.uri, b.meta, m)
+        else -> false
+    }
+} catch (e: Exception) {
+    false
+}
+
+fun fileQuery(b: Book): String =
+    b.base.replace(Regex("\\(\\d+\\)"), " ").replace(Regex("[_\\-]+"), " ").replace(Regex("\\s+"), " ").trim()
+
+fun lookupBook(query: String): Pair<String?, String?>? {
+    if (query.isBlank()) return null
+    val q = java.net.URLEncoder.encode(query, "UTF-8")
+    try {
+        val v = org.json.JSONObject(httpGet("https://www.googleapis.com/books/v1/volumes?q=$q&maxResults=1&printType=books"))
+            .optJSONArray("items")?.optJSONObject(0)?.optJSONObject("volumeInfo")
+        if (v != null) {
+            val t = v.optString("title").trim().ifBlank { null }
+            val au = v.optJSONArray("authors")?.optString(0)?.trim()?.ifBlank { null }
+            if (t != null) return t to au
+        }
+    } catch (e: Exception) {
+        // пробуємо запасний сервіс
+    }
+    try {
+        val d = org.json.JSONObject(httpGet("https://openlibrary.org/search.json?q=$q&limit=1&fields=title,author_name"))
+            .optJSONArray("docs")?.optJSONObject(0)
+        if (d != null) {
+            val t = d.optString("title").trim().ifBlank { null }
+            val au = d.optJSONArray("author_name")?.optString(0)?.trim()?.ifBlank { null }
+            if (t != null) return t to au
+        }
+    } catch (e: Exception) {
+        // нічого не знайдено
+    }
+    return null
+}
+
 // ---------- Побудова нового імені ----------
 
 fun pad(n: String?): String? {
@@ -272,7 +443,13 @@ fun clean(s: String): String =
 
 // ---------- ШІ: визначення книги за уривком ----------
 
-data class AiResult(val title: String?, val author: String?, val conf: String)
+data class AiResult(
+    val title: String?,
+    val author: String?,
+    val conf: String,
+    val series: String? = null,
+    val number: String? = null
+)
 
 fun stripTags(html: String): String =
     html.replace(Regex("(?s)<(script|style)[^>]*>.*?</\\1>"), " ")
@@ -307,421 +484,4 @@ fun extractText(ctx: Context, uri: Uri, ext: String, maxChars: Int = 6000): Stri
                     if (ev == XmlPullParser.START_TAG && p.name == "body") inBody = true
                     if (ev == XmlPullParser.TEXT && inBody) {
                         val t = p.text.trim()
-                        if (t.isNotEmpty()) sb.append(t).append(' ')
-                    }
-                    ev = p.next()
-                }
-            }
-        }
-    } catch (e: Exception) {
-        // беремо те, що встигли
-    }
-    return sb.toString().take(maxChars)
-}
-
-fun askClaude(apiKey: String, excerpt: String, fileName: String): AiResult? {
-    if (excerpt.isBlank()) return null
-    return try {
-        val prompt = "Нижче уривок із книги (назва файлу: $fileName). Визначи, що це за книга. " +
-            "Відповідай ТІЛЬКИ одним JSON-об'єктом без пояснень: " +
-            "{\"title\": \"...\", \"author\": \"...\", \"confidence\": \"high|medium|low\"}. " +
-            "Назву й автора пиши мовою цього видання (мовою уривка). " +
-            "Якщо не знаєш цю книгу, постав confidence low і залиш поля порожніми.\n\n" + excerpt
-        val body = org.json.JSONObject()
-            .put("model", "claude-haiku-5-5")
-            .put("max_tokens", 300)
-            .put(
-                "messages",
-                org.json.JSONArray().put(
-                    org.json.JSONObject().put("role", "user").put("content", prompt)
-                )
-            )
-        val c = java.net.URL("https://api.anthropic.com/v1/messages").openConnection() as java.net.HttpURLConnection
-        c.requestMethod = "POST"
-        c.connectTimeout = 15000
-        c.readTimeout = 30000
-        c.doOutput = true
-        c.setRequestProperty("x-api-key", apiKey.trim())
-        c.setRequestProperty("anthropic-version", "2023-06-01")
-        c.setRequestProperty("content-type", "application/json")
-        c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-        if (c.responseCode !in 200..299) return null
-        val resp = c.inputStream.bufferedReader().use { it.readText() }
-        val reply = org.json.JSONObject(resp).getJSONArray("content").getJSONObject(0).getString("text")
-        val j = org.json.JSONObject(reply.substring(reply.indexOf('{'), reply.lastIndexOf('}') + 1))
-        val conf = j.optString("confidence", "low")
-        if (conf == "low") null
-        else AiResult(
-            j.optString("title").trim().ifBlank { null },
-            j.optString("author").trim().ifBlank { null },
-            conf
-        )
-    } catch (e: Exception) {
-        null
-    }
-}
-
-// ---------- Пошук назви в інтернеті ----------
-
-fun httpGet(url: String): String {
-    val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-    c.connectTimeout = 8000
-    c.readTimeout = 8000
-    c.setRequestProperty("User-Agent", "BookRenamer/1.0")
-    return c.inputStream.bufferedReader().use { it.readText() }
-}
-
-fun lookupTitle(query: String): String? {
-    if (query.isBlank()) return null
-    val q = java.net.URLEncoder.encode(query, "UTF-8")
-    try {
-        val json = org.json.JSONObject(httpGet("https://www.googleapis.com/books/v1/volumes?q=$q&maxResults=1&printType=books"))
-        val t = json.optJSONArray("items")?.optJSONObject(0)?.optJSONObject("volumeInfo")?.optString("title")
-        if (!t.isNullOrBlank()) return t.trim()
-    } catch (e: Exception) {
-        // пробуємо запасний сервіс
-    }
-    try {
-        val json = org.json.JSONObject(httpGet("https://openlibrary.org/search.json?q=$q&limit=1&fields=title"))
-        val t = json.optJSONArray("docs")?.optJSONObject(0)?.optString("title")
-        if (!t.isNullOrBlank()) return t.trim()
-    } catch (e: Exception) {
-        // нічого не знайдено
-    }
-    return null
-}
-
-fun onlineQuery(b: Book): String =
-    (b.base.replace(Regex("\\(\\d+\\)"), " ").replace(Regex("[_\\-]+"), " ") + " " + (b.meta.author ?: ""))
-        .replace(Regex("\\s+"), " ").trim()
-
-// Назви-сміття в метаданих: хеші, UUID, "Unknown" тощо
-val junkRegex = Regex("(?i)^(urn:uuid:)?[0-9a-f-]{16,}$")
-
-fun looksLikeJunk(t: String): Boolean {
-    val x = t.trim()
-    if (junkRegex.matches(x)) return true
-    return x.lowercase() in setOf("unknown", "untitled", "title", "без назви", "невідомо", "невідомий")
-}
-
-fun titleIsBad(b: Book): Boolean {
-    val t = b.meta.title
-    return t.isNullOrBlank() || looksLikeJunk(t)
-}
-
-fun newName(b: Book, s: Settings, onlineTitle: String? = null): String {
-    val parts = s.order.mapNotNull { p ->
-        when (p) {
-            Part.SERIES -> if (!b.isSeries) null else listOfNotNull(
-                if (s.useSeriesName) b.meta.series?.takeIf { it.isNotBlank() } else null,
-                if (s.useNumber) pad(b.meta.number) else null
-            ).joinToString(" ").ifBlank { null }
-            Part.TITLE -> if (s.useTitle) (b.meta.title?.takeIf { it.isNotBlank() && !looksLikeJunk(it) } ?: onlineTitle ?: b.base) else null
-            Part.AUTHOR -> if (!s.useAuthor) null else {
-                val orig = if (s.origAuthor) b.meta.authorOrig?.takeIf { it.isNotBlank() } else null
-                orig ?: b.meta.author?.takeIf { it.isNotBlank() }
-            }
-        }
-    }
-    val core = clean(parts.joinToString(s.sep)).take(200).trim()
-    return if (core.isBlank()) b.name else core + "." + b.ext
-}
-
-// ---------- Інтерфейс ----------
-
-class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContent {
-            MaterialTheme {
-                Surface(Modifier.fillMaxSize()) { App() }
-            }
-        }
-    }
-}
-
-@Composable
-fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Checkbox(checked = checked, onCheckedChange = onChange)
-        Text(label)
-    }
-}
-
-@Composable
-fun App() {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-
-    var books by remember { mutableStateOf<List<Book>>(emptyList()) }
-    var s by remember { mutableStateOf(Settings()) }
-    var filter by remember { mutableStateOf(0) } // 0 усі, 1 серійні, 2 без серії
-    var recursive by remember { mutableStateOf(true) }
-    var status by remember { mutableStateOf("Оберіть теку або файли") }
-    var showPreview by remember { mutableStateOf(false) }
-    var excluded by remember { mutableStateOf(setOf<Uri>()) }
-    var onlineTitles by remember { mutableStateOf(mapOf<Uri, String>()) }
-    var aiResults by remember { mutableStateOf(mapOf<Uri, AiResult>()) }
-    var showNameSettings by remember { mutableStateOf(true) }
-    var apiKey by remember { mutableStateOf(ctx.getSharedPreferences("prefs", 0).getString("key", "") ?: "") }
-
-    fun eff(b: Book): Book {
-        val r = aiResults[b.uri] ?: return b
-        return b.copy(
-            meta = b.meta.copy(
-                title = if (titleIsBad(b) && !r.title.isNullOrBlank()) r.title else b.meta.title,
-                author = if (b.meta.author.isNullOrBlank() && !r.author.isNullOrBlank()) r.author else b.meta.author
-            )
-        )
-    }
-
-    val pickFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri != null) scope.launch {
-            status = "Читаю книги..."
-            books = withContext(Dispatchers.IO) {
-                listFiles(ctx, uri, recursive).mapNotNull { loadBook(ctx, it.first, it.second) }
-            }
-            status = "Знайдено книг: ${books.size}"
-        }
-    }
-
-    val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
-        val d = r.data ?: return@rememberLauncherForActivityResult
-        val uris = mutableListOf<Uri>()
-        val clip = d.clipData
-        if (clip != null) {
-            for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
-        } else {
-            d.data?.let { uris.add(it) }
-        }
-        scope.launch {
-            status = "Читаю книги..."
-            books = withContext(Dispatchers.IO) {
-                uris.mapNotNull { u -> loadBook(ctx, u, displayName(ctx, u)) }
-            }
-            status = "Вибрано книг: ${books.size}"
-        }
-    }
-
-    val visible = books.filter {
-        when (filter) {
-            1 -> it.isSeries
-            2 -> !it.isSeries
-            else -> true
-        }
-    }
-    val plan = visible.map { it to newName(eff(it), s, onlineTitles[it.uri]) }.filter { it.second != it.first.name }
-
-    // ----- Екран перегляду змін -----
-    if (showPreview) {
-        Column(Modifier.fillMaxSize().systemBarsPadding().padding(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "Перегляд змін: ${plan.size}",
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedButton(onClick = {
-                    excluded = if (excluded.isEmpty()) plan.map { it.first.uri }.toSet() else emptySet()
-                }) { Text("Усі") }
-            }
-            Spacer(Modifier.height(8.dp))
-            LazyColumn(Modifier.weight(1f)) {
-                items(plan) { (b, n) ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(
-                            checked = b.uri !in excluded,
-                            onCheckedChange = { on -> excluded = if (on) excluded - b.uri else excluded + b.uri }
-                        )
-                        Column {
-                            Text("було: ${b.name}", style = MaterialTheme.typography.bodySmall)
-                            Text("стане: $n", style = MaterialTheme.typography.bodyMedium)
-                            aiResults[b.uri]?.let {
-                                Text("визначено ШІ (${it.conf}), перевірте", style = MaterialTheme.typography.labelSmall)
-                            }
-                            if (onlineTitles.containsKey(b.uri)) {
-                                Text("назву знайдено в інтернеті, перевірте", style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
-                    }
-                    HorizontalDivider()
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            Row {
-                OutlinedButton(onClick = { showPreview = false }) { Text("Назад") }
-                Spacer(Modifier.width(8.dp))
-                Button(onClick = {
-                    scope.launch {
-                        val todo = plan.filter { it.first.uri !in excluded }
-                        val ok = withContext(Dispatchers.IO) {
-                            todo.count { (b, n) ->
-                                try {
-                                    DocumentsContract.renameDocument(ctx.contentResolver, b.uri, n) != null
-                                } catch (e: Exception) {
-                                    false
-                                }
-                            }
-                        }
-                        status = "Перейменовано: $ok із ${todo.size}. Щоб продовжити, оберіть теку чи файли знову."
-                        books = emptyList()
-                        onlineTitles = emptyMap()
-                        aiResults = emptyMap()
-                        showPreview = false
-                    }
-                }) { Text("Перейменувати (${plan.count { it.first.uri !in excluded }})") }
-            }
-        }
-        return
-    }
-
-    // ----- Головний екран -----
-    Column(
-        Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(12.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "Перейменування книг",
-                style = MaterialTheme.typography.titleLarge,
-                modifier = Modifier.weight(1f)
-            )
-            TextButton(onClick = { showNameSettings = !showNameSettings }) {
-                Text(if (showNameSettings) "Сховати ▲" else "Показати ▼")
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        Row {
-            Button(onClick = { pickFolder.launch(null) }) { Text("Обрати теку") }
-            Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = {
-                pickFiles.launch(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                    type = "*/*"
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-                })
-            }) { Text("Обрати файли") }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Switch(checked = recursive, onCheckedChange = { recursive = it })
-            Spacer(Modifier.width(8.dp))
-            Text("Теки всередині теки")
-        }
-        Text("$status (серійних: ${books.count { it.isSeries }}, показано: ${visible.size})")
-
-        Spacer(Modifier.height(12.dp))
-        Text("Які книги", style = MaterialTheme.typography.titleMedium)
-        Row {
-            listOf("Усі", "Серійні", "Несерійні").forEachIndexed { i, label ->
-                FilterChip(selected = filter == i, onClick = { filter = i }, label = { Text(label) })
-                Spacer(Modifier.width(6.dp))
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-        if (showNameSettings) {
-        Text("Що ставити в ім'я", style = MaterialTheme.typography.titleMedium)
-        CheckRow("Серія", s.useSeriesName) { s = s.copy(useSeriesName = it) }
-        CheckRow("Номер", s.useNumber) { s = s.copy(useNumber = it) }
-        CheckRow("Назва", s.useTitle) { s = s.copy(useTitle = it) }
-        CheckRow("Автор", s.useAuthor) { s = s.copy(useAuthor = it) }
-        CheckRow("Автор мовою оригіналу", s.origAuthor) { s = s.copy(origAuthor = it) }
-        }
-        Spacer(Modifier.height(12.dp))
-        Text("Пошук назв", style = MaterialTheme.typography.titleMedium)
-        CheckRow("Шукати назву в інтернеті (якщо в метаданих сміття)", s.online) { s = s.copy(online = it) }
-        CheckRow("ШІ: визначити книгу за уривком тексту (EPUB, FB2)", s.ai) { s = s.copy(ai = it) }
-        if (s.ai) {
-            OutlinedTextField(
-                value = apiKey,
-                onValueChange = {
-                    apiKey = it
-                    ctx.getSharedPreferences("prefs", 0).edit().putString("key", it).apply()
-                },
-                label = { Text("API-ключ Anthropic") },
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation()
-            )
-            Text(
-                "Уривок книги (близько 6000 знаків) надсилається в Anthropic.",
-                style = MaterialTheme.typography.labelSmall
-            )
-        }
-
-        if (showNameSettings) {
-        Spacer(Modifier.height(12.dp))
-        Text("Порядок частин", style = MaterialTheme.typography.titleMedium)
-        s.order.forEachIndexed { i, part ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("${i + 1}. ${part.label}", Modifier.weight(1f))
-                TextButton(onClick = {
-                    val l = s.order.toMutableList()
-                    if (i > 0) { Collections.swap(l, i, i - 1); s = s.copy(order = l) }
-                }) { Text("▲") }
-                TextButton(onClick = {
-                    val l = s.order.toMutableList()
-                    if (i < l.size - 1) { Collections.swap(l, i, i + 1); s = s.copy(order = l) }
-                }) { Text("▼") }
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        Text("Розділювач", style = MaterialTheme.typography.titleMedium)
-        Row(Modifier.horizontalScroll(rememberScrollState())) {
-            listOf("Тире" to " - ", "Пробіл" to " ", "Крапка" to ". ", "Підкреслення" to "_").forEach { (label, value) ->
-                FilterChip(selected = s.sep == value, onClick = { s = s.copy(sep = value) }, label = { Text(label) })
-                Spacer(Modifier.width(6.dp))
-            }
-        }
-        OutlinedTextField(
-            value = s.sep,
-            onValueChange = { s = s.copy(sep = it) },
-            label = { Text("Свій розділювач") },
-            singleLine = true
-        )
-        }
-
-        Spacer(Modifier.height(12.dp))
-        visible.firstOrNull()?.let {
-            Text("Приклад:", style = MaterialTheme.typography.titleSmall)
-            Text(it.name, style = MaterialTheme.typography.bodySmall)
-            Text("→ ${newName(eff(it), s, onlineTitles[it.uri])}", style = MaterialTheme.typography.bodyMedium)
-            Spacer(Modifier.height(12.dp))
-        }
-        Button(
-            enabled = plan.isNotEmpty(),
-            onClick = {
-                scope.launch {
-                    excluded = emptySet()
-                    var ai = mapOf<Uri, AiResult>()
-                    if (s.ai && apiKey.isNotBlank()) {
-                        status = "ШІ читає уривки книг..."
-                        ai = withContext(Dispatchers.IO) {
-                            val res = mutableMapOf<Uri, AiResult>()
-                            val todo = visible.filter {
-                                (titleIsBad(it) || it.meta.author.isNullOrBlank()) && it.ext in setOf("epub", "fb2")
-                            }
-                            for (b in todo) {
-                                val r = askClaude(apiKey, extractText(ctx, b.uri, b.ext), b.name)
-                                if (r != null) res[b.uri] = r
-                            }
-                            res
-                        }
-                    }
-                    aiResults = ai
-                    if (s.online) {
-                        status = "Шукаю назви в інтернеті..."
-                        onlineTitles = withContext(Dispatchers.IO) {
-                            visible.filter { titleIsBad(it) && !ai.containsKey(it.uri) }
-                                .mapNotNull { b -> lookupTitle(onlineQuery(b))?.let { b.uri to it } }
-                                .toMap()
-                        }
-                    } else {
-                        onlineTitles = emptyMap()
-                    }
-                    status = "Визначено ШІ: ${ai.size}, знайдено в інтернеті: ${onlineTitles.size}"
-                    showPreview = true
-                }
-            }
-        ) { Text("Показати зміни (${plan.size})") }
-    }
-}
+                        if (t.i
