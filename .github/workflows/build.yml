@@ -107,7 +107,9 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <application
-                  android:label="Книги"
+                  android:label="Перейменовувач Claude"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
                   <activity
                       android:name=".MainActivity"
@@ -119,6 +121,77 @@ jobs:
                   </activity>
               </application>
           </manifest>
+          EOF
+
+          mkdir -p app/src/main/res/drawable app/src/main/res/mipmap-anydpi app/src/main/res/mipmap-anydpi-v26
+
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,56 C48,52 40,52 34,54 L34,78 C40,76 48,76 54,80 Z" />
+              <path
+                  android:fillColor="#F6EFE6"
+                  android:pathData="M54,56 C60,52 68,52 74,54 L74,78 C68,76 60,76 54,80 Z" />
+              <path
+                  android:strokeColor="#C9B8A3"
+                  android:strokeWidth="1.2"
+                  android:pathData="M54,56 L54,80" />
+              <path
+                  android:strokeColor="#D8C9B6"
+                  android:strokeWidth="1"
+                  android:pathData="M38,60 L49,61 M38,65 L49,66 M38,70 L49,71 M59,61 L70,60 M59,66 L70,65 M59,71 L70,70" />
+              <group
+                  android:pivotX="54"
+                  android:pivotY="38"
+                  android:rotation="-30">
+                  <path
+                      android:fillColor="#2A1D15"
+                      android:pathData="M38,35.5 L60,35.5 L60,40.5 L38,40.5 Z" />
+                  <path
+                      android:fillColor="#2A1D15"
+                      android:pathData="M34.5,38 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 Z" />
+                  <path
+                      android:fillColor="#2A1D15"
+                      android:pathData="M57,38 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+                  <path
+                      android:fillColor="#D97757"
+                      android:pathData="M66,34 L76,34 L76,42 L66,42 Z" />
+                  <path
+                      android:fillColor="#D97757"
+                      android:pathData="M36.5,38 a1.5,1.5 0 1,0 3,0 a1.5,1.5 0 1,0 -3,0 Z" />
+              </group>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher_background.xml <<'EOF'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#D97757" />
+          </shape>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF'
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item>
+                  <shape android:shape="rectangle">
+                      <solid android:color="#D97757" />
+                      <corners android:radius="20dp" />
+                  </shape>
+              </item>
+              <item android:drawable="@drawable/ic_launcher_foreground" />
+          </layer-list>
           EOF
 
       - name: Build debug APK
