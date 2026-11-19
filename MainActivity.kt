@@ -484,4 +484,832 @@ fun extractText(ctx: Context, uri: Uri, ext: String, maxChars: Int = 6000): Stri
                 while (ev != XmlPullParser.END_DOCUMENT && sb.length < maxChars) {
                     if (ev == XmlPullParser.START_TAG && p.name == "body") inBody = true
                     if (ev == XmlPullParser.TEXT && inBody) {
-                        val t = p.text.tr
+                        val t = p.text.trim()
+                        if (t.isNotEmpty()) sb.append(t).append(' ')
+                    }
+                    ev = p.next()
+                }
+            }
+        }
+    } catch (e: Exception) {
+        // беремо те, що встигли
+    }
+    return sb.toString().take(maxChars)
+}
+
+fun askClaude(apiKey: String, excerpt: String, fileName: String): AiResult? {
+    if (excerpt.isBlank()) return null
+    return try {
+        val prompt = "Нижче уривок із книги (назва файлу: $fileName). Визначи, що це за книга. " +
+            "Відповідай ТІЛЬКИ одним JSON-об'єктом без пояснень: " +
+            "{\"title\": \"...\", \"author\": \"...\", \"series\": \"...\", \"number\": \"...\", \"confidence\": \"high|medium|low\"}. " +
+            "Якщо книга не з серії, series і number залиш порожніми; номер у серії пиши цифрою. " +
+            "Назву й автора пиши мовою цього видання (мовою уривка). " +
+            "Якщо не знаєш цю книгу, постав confidence low і залиш поля порожніми.\n\n" + excerpt
+        val body = org.json.JSONObject()
+            .put("model", "claude-haiku-5-5")
+            .put("max_tokens", 300)
+            .put(
+                "messages",
+                org.json.JSONArray().put(
+                    org.json.JSONObject().put("role", "user").put("content", prompt)
+                )
+            )
+        val c = java.net.URL("https://api.anthropic.com/v1/messages").openConnection() as java.net.HttpURLConnection
+        c.requestMethod = "POST"
+        c.connectTimeout = 15000
+        c.readTimeout = 30000
+        c.doOutput = true
+        c.setRequestProperty("x-api-key", apiKey.trim())
+        c.setRequestProperty("anthropic-version", "2023-06-01")
+        c.setRequestProperty("content-type", "application/json")
+        c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        if (c.responseCode !in 200..299) return null
+        val resp = c.inputStream.bufferedReader().use { it.readText() }
+        val reply = org.json.JSONObject(resp).getJSONArray("content").getJSONObject(0).getString("text")
+        val j = org.json.JSONObject(reply.substring(reply.indexOf('{'), reply.lastIndexOf('}') + 1))
+        val conf = j.optString("confidence", "low")
+        if (conf == "low") null
+        else AiResult(
+            j.optString("title").trim().ifBlank { null },
+            j.optString("author").trim().ifBlank { null },
+            conf,
+            j.optString("series").trim().ifBlank { null },
+            j.optString("number").trim().ifBlank { null }
+        )
+    } catch (e: Exception) {
+        null
+    }
+}
+
+// ---------- Пошук назви в інтернеті ----------
+
+fun httpGet(url: String): String {
+    val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+    c.connectTimeout = 8000
+    c.readTimeout = 8000
+    c.setRequestProperty("User-Agent", "BookRenamer/1.0")
+    return c.inputStream.bufferedReader().use { it.readText() }
+}
+
+fun lookupTitle(query: String): String? {
+    if (query.isBlank()) return null
+    val q = java.net.URLEncoder.encode(query, "UTF-8")
+    try {
+        val json = org.json.JSONObject(httpGet("https://www.googleapis.com/books/v1/volumes?q=$q&maxResults=1&printType=books"))
+        val t = json.optJSONArray("items")?.optJSONObject(0)?.optJSONObject("volumeInfo")?.optString("title")
+        if (!t.isNullOrBlank()) return t.trim()
+    } catch (e: Exception) {
+        // пробуємо запасний сервіс
+    }
+    try {
+        val json = org.json.JSONObject(httpGet("https://openlibrary.org/search.json?q=$q&limit=1&fields=title"))
+        val t = json.optJSONArray("docs")?.optJSONObject(0)?.optString("title")
+        if (!t.isNullOrBlank()) return t.trim()
+    } catch (e: Exception) {
+        // нічого не знайдено
+    }
+    return null
+}
+
+fun onlineQuery(b: Book): String {
+    val good = b.meta.title?.takeIf { it.isNotBlank() && !looksLikeJunk(it) }
+    val t = (good ?: b.base).replace(Regex("\\(\\d+\\)"), " ").replace(Regex("[_\\-]+"), " ")
+    return (t + " " + (b.meta.author ?: "")).replace(Regex("\\s+"), " ").trim()
+}
+
+// ---------- Автор мовою оригіналу (Wikidata) ----------
+
+val authorCache = mutableMapOf<String, String?>()
+
+fun wdGet(params: String): org.json.JSONObject =
+    org.json.JSONObject(httpGet("https://www.wikidata.org/w/api.php?format=json&$params"))
+
+fun lookupOriginalAuthor(name: String): String? {
+    val key = name.trim()
+    if (key.isEmpty()) return null
+    if (authorCache.containsKey(key)) return authorCache[key]
+    var result: String? = null
+    try {
+        val q = java.net.URLEncoder.encode(key, "UTF-8")
+        var ids = listOf<String>()
+        for (lang in listOf("uk", "en", "ru")) {
+            val arr = wdGet("action=wbsearchentities&type=item&limit=5&language=$lang&uselang=$lang&search=$q")
+                .optJSONArray("search")
+            if (arr != null && arr.length() > 0) {
+                ids = (0 until arr.length()).map { arr.getJSONObject(it).getString("id") }
+                break
+            }
+        }
+        if (ids.isNotEmpty()) {
+            val ents = wdGet("action=wbgetentities&props=claims%7Clabels&languages=en&ids=" + ids.joinToString("%7C"))
+                .optJSONObject("entities")
+            for (id in ids) {
+                val ent = ents?.optJSONObject(id) ?: continue
+                val claims = ent.optJSONObject("claims") ?: continue
+                val p31 = claims.optJSONArray("P31")
+                var human = false
+                if (p31 != null) {
+                    for (k in 0 until p31.length()) {
+                        val v = p31.getJSONObject(k).optJSONObject("mainsnak")?.optJSONObject("datavalue")
+                            ?.optJSONObject("value")?.optString("id")
+                        if (v == "Q5") human = true
+                    }
+                }
+                if (!human) continue
+                // 1) ім'я мовою автора (P103 -> код мови -> мітка)
+                val langId = claims.optJSONArray("P103")?.optJSONObject(0)?.optJSONObject("mainsnak")
+                    ?.optJSONObject("datavalue")?.optJSONObject("value")?.optString("id")
+                if (!langId.isNullOrBlank()) {
+                    val code = wdGet("action=wbgetentities&props=claims&ids=$langId")
+                        .optJSONObject("entities")?.optJSONObject(langId)?.optJSONObject("claims")
+                        ?.optJSONArray("P424")?.optJSONObject(0)?.optJSONObject("mainsnak")
+                        ?.optJSONObject("datavalue")?.optString("value")
+                    if (!code.isNullOrBlank()) {
+                        val lab = wdGet("action=wbgetentities&props=labels&languages=$code&ids=$id")
+                            .optJSONObject("entities")?.optJSONObject(id)?.optJSONObject("labels")
+                            ?.optJSONObject(code)?.optString("value")
+                        if (!lab.isNullOrBlank()) { result = lab; break }
+                    }
+                }
+                // 2) "ім'я рідною мовою" (P1559)
+                val native = claims.optJSONArray("P1559")?.optJSONObject(0)?.optJSONObject("mainsnak")
+                    ?.optJSONObject("datavalue")?.optJSONObject("value")?.optString("text")
+                if (!native.isNullOrBlank()) { result = native; break }
+                // 3) англійська мітка
+                val en = ent.optJSONObject("labels")?.optJSONObject("en")?.optString("value")
+                if (!en.isNullOrBlank()) { result = en; break }
+            }
+        }
+    } catch (e: Exception) {
+        // нічого не знайдено
+    }
+    authorCache[key] = result
+    return result
+}
+
+// Назви-сміття в метаданих: хеші, UUID, "Unknown" тощо
+val junkRegex = Regex("(?i)^(urn:uuid:)?[0-9a-f-]{16,}$")
+
+fun looksLikeJunk(t: String): Boolean {
+    val x = t.trim()
+    if (junkRegex.matches(x)) return true
+    return x.lowercase() in setOf("unknown", "untitled", "title", "без назви", "невідомо", "невідомий")
+}
+
+fun titleIsBad(b: Book): Boolean {
+    val t = b.meta.title
+    return t.isNullOrBlank() || looksLikeJunk(t)
+}
+
+fun newName(b: Book, s: Settings, onlineTitle: String? = null, origAuthorOnline: String? = null): String {
+    val parts = s.order.mapNotNull { p ->
+        when (p) {
+            Part.SERIES -> if (!b.isSeries) null else listOfNotNull(
+                if (s.useSeriesName) b.meta.series?.takeIf { it.isNotBlank() } else null,
+                if (s.useNumber) pad(b.meta.number) else null
+            ).joinToString(" ").ifBlank { null }
+            Part.TITLE -> if (!s.useTitle) null else {
+                val good = b.meta.title?.takeIf { it.isNotBlank() && !looksLikeJunk(it) }
+                if (s.onlineAll) (onlineTitle ?: good ?: b.base) else (good ?: onlineTitle ?: b.base)
+            }
+            Part.AUTHOR -> if (!s.useAuthor) null else {
+                val orig = if (s.origAuthor) (origAuthorOnline ?: b.meta.authorOrig?.takeIf { it.isNotBlank() }) else null
+                orig ?: b.meta.author?.takeIf { it.isNotBlank() }
+            }
+        }
+    }
+    val core = clean(parts.joinToString(s.sep)).take(200).trim()
+    return if (core.isBlank()) b.name else core + "." + b.ext
+}
+
+// ---------- Інтерфейс ----------
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme {
+                Surface(Modifier.fillMaxSize()) { App() }
+            }
+        }
+    }
+}
+
+@Composable
+fun ProgressBlock(text: String, progress: Float?) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Text(text, style = MaterialTheme.typography.bodySmall)
+        if (progress != null) {
+            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+        } else {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
+fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = checked, onCheckedChange = onChange)
+        Text(label)
+    }
+}
+
+@Composable
+fun RenamerScreen(onMenu: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var books by remember { mutableStateOf<List<Book>>(emptyList()) }
+    var s by remember { mutableStateOf(Settings()) }
+    var filter by remember { mutableStateOf(0) } // 0 усі, 1 серійні, 2 без серії
+    var recursive by remember { mutableStateOf(true) }
+    var status by remember { mutableStateOf("Оберіть теку або файли") }
+    var showPreview by remember { mutableStateOf(false) }
+    var excluded by remember { mutableStateOf(setOf<Uri>()) }
+    var onlineTitles by remember { mutableStateOf(mapOf<Uri, String>()) }
+    var aiResults by remember { mutableStateOf(mapOf<Uri, AiResult>()) }
+    var showNameSettings by remember { mutableStateOf(true) }
+    var origAuthors by remember { mutableStateOf(mapOf<Uri, String>()) }
+    var busy by remember { mutableStateOf(false) }
+    var progress by remember { mutableStateOf<Float?>(null) }
+    var progressText by remember { mutableStateOf("") }
+
+    fun tick(text: String, i: Int, n: Int) {
+        progressText = "$text: $i / $n"
+        progress = if (n > 0) i.toFloat() / n else null
+    }
+    var apiKey by remember { mutableStateOf(ctx.getSharedPreferences("prefs", 0).getString("key", "") ?: "") }
+
+    fun eff(b: Book): Book {
+        val r = aiResults[b.uri] ?: return b
+        return b.copy(
+            meta = b.meta.copy(
+                title = if (titleIsBad(b) && !r.title.isNullOrBlank()) r.title else b.meta.title,
+                author = if (b.meta.author.isNullOrBlank() && !r.author.isNullOrBlank()) r.author else b.meta.author
+            )
+        )
+    }
+
+    val pickFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) scope.launch {
+            busy = true
+            progress = null
+            progressText = "Шукаю файли..."
+            val files = withContext(Dispatchers.IO) { listFiles(ctx, uri, recursive) }
+            books = withContext(Dispatchers.IO) {
+                files.mapIndexedNotNull { i, f ->
+                    tick("Читаю книги", i + 1, files.size)
+                    loadBook(ctx, f.first, f.second)
+                }
+            }
+            busy = false
+            status = "Знайдено книг: ${books.size}"
+        }
+    }
+
+    val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val d = r.data ?: return@rememberLauncherForActivityResult
+        val uris = mutableListOf<Uri>()
+        val clip = d.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+        } else {
+            d.data?.let { uris.add(it) }
+        }
+        scope.launch {
+            busy = true
+            progress = null
+            progressText = "Читаю книги..."
+            books = withContext(Dispatchers.IO) {
+                uris.mapIndexedNotNull { i, u ->
+                    tick("Читаю книги", i + 1, uris.size)
+                    loadBook(ctx, u, displayName(ctx, u))
+                }
+            }
+            busy = false
+            status = "Вибрано книг: ${books.size}"
+        }
+    }
+
+    val visible = books.filter {
+        when (filter) {
+            1 -> it.isSeries
+            2 -> !it.isSeries
+            else -> true
+        }
+    }
+    val plan = visible.map { it to newName(eff(it), s, onlineTitles[it.uri], origAuthors[it.uri]) }.filter { it.second != it.first.name }
+
+    // ----- Екран перегляду змін -----
+    if (showPreview) {
+        Column(Modifier.fillMaxSize().systemBarsPadding().padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Перегляд змін: ${plan.size}",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = {
+                    excluded = if (excluded.isEmpty()) plan.map { it.first.uri }.toSet() else emptySet()
+                }) { Text("Усі") }
+            }
+            Spacer(Modifier.height(8.dp))
+            LazyColumn(Modifier.weight(1f)) {
+                items(plan) { (b, n) ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = b.uri !in excluded,
+                            onCheckedChange = { on -> excluded = if (on) excluded - b.uri else excluded + b.uri }
+                        )
+                        Column {
+                            Text("було: ${b.name}", style = MaterialTheme.typography.bodySmall)
+                            Text("стане: $n", style = MaterialTheme.typography.bodyMedium)
+                            aiResults[b.uri]?.let {
+                                Text("визначено ШІ (${it.conf}), перевірте", style = MaterialTheme.typography.labelSmall)
+                            }
+                            if (onlineTitles.containsKey(b.uri)) {
+                                Text("назву знайдено в інтернеті, перевірте", style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
+                    HorizontalDivider()
+                }
+            }
+            if (busy) ProgressBlock(progressText, progress)
+            Spacer(Modifier.height(8.dp))
+            Row {
+                OutlinedButton(onClick = { showPreview = false }) { Text("Назад") }
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = {
+                    scope.launch {
+                        busy = true
+                        val todo = plan.filter { it.first.uri !in excluded }
+                        var done = 0
+                        val ok = withContext(Dispatchers.IO) {
+                            todo.count { (b, n) ->
+                                val r = try {
+                                    DocumentsContract.renameDocument(ctx.contentResolver, b.uri, n) != null
+                                } catch (e: Exception) {
+                                    false
+                                }
+                                done++
+                                tick("Перейменовую", done, todo.size)
+                                r
+                            }
+                        }
+                        busy = false
+                        status = "Перейменовано: $ok із ${todo.size}. Щоб продовжити, оберіть теку чи файли знову."
+                        books = emptyList()
+                        onlineTitles = emptyMap()
+                        aiResults = emptyMap()
+                        origAuthors = emptyMap()
+                        showPreview = false
+                    }
+                }) { Text("Перейменувати (${plan.count { it.first.uri !in excluded }})") }
+            }
+        }
+        return
+    }
+
+    // ----- Головний екран -----
+    Column(
+        Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onMenu) { Text("☰", style = MaterialTheme.typography.titleLarge) }
+            Text(
+                "Перейменовувач",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = { showNameSettings = !showNameSettings }) {
+                Text(if (showNameSettings) "Сховати ▲" else "Показати ▼")
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row {
+            Button(onClick = { pickFolder.launch(null) }) { Text("Обрати теку") }
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton(onClick = {
+                pickFiles.launch(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    type = "*/*"
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                })
+            }) { Text("Обрати файли") }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(checked = recursive, onCheckedChange = { recursive = it })
+            Spacer(Modifier.width(8.dp))
+            Text("Теки всередині теки")
+        }
+        Text("$status (серійних: ${books.count { it.isSeries }}, показано: ${visible.size})")
+        if (busy) ProgressBlock(progressText, progress)
+
+        Spacer(Modifier.height(12.dp))
+        Text("Які книги", style = MaterialTheme.typography.titleMedium)
+        Row {
+            listOf("Усі", "Серійні", "Несерійні").forEachIndexed { i, label ->
+                FilterChip(selected = filter == i, onClick = { filter = i }, label = { Text(label) })
+                Spacer(Modifier.width(6.dp))
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Text("Пошук назв", style = MaterialTheme.typography.titleMedium)
+        CheckRow("Шукати назву в інтернеті, якщо в метаданих сміття", s.online) { s = s.copy(online = it) }
+        CheckRow("Шукати назву в інтернеті для всіх книг (замінює назву з файлу)", s.onlineAll) { s = s.copy(onlineAll = it) }
+        CheckRow("ШІ: визначити книгу за уривком тексту (EPUB, FB2)", s.ai) { s = s.copy(ai = it) }
+        if (s.ai) {
+            OutlinedTextField(
+                value = apiKey,
+                onValueChange = {
+                    apiKey = it
+                    ctx.getSharedPreferences("prefs", 0).edit().putString("key", it).apply()
+                },
+                label = { Text("API-ключ Anthropic") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation()
+            )
+            Text(
+                "Уривок книги (близько 6000 знаків) надсилається в Anthropic.",
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+        if (showNameSettings) {
+        Text("Що ставити в ім'я", style = MaterialTheme.typography.titleMedium)
+        CheckRow("Серія", s.useSeriesName) { s = s.copy(useSeriesName = it) }
+        CheckRow("Номер", s.useNumber) { s = s.copy(useNumber = it) }
+        CheckRow("Назва", s.useTitle) { s = s.copy(useTitle = it) }
+        CheckRow("Автор", s.useAuthor) { s = s.copy(useAuthor = it) }
+        CheckRow("Автор мовою оригіналу (шукає в інтернеті для всіх)", s.origAuthor) { s = s.copy(origAuthor = it) }
+        }
+        if (showNameSettings) {
+        Spacer(Modifier.height(12.dp))
+        Text("Порядок частин", style = MaterialTheme.typography.titleMedium)
+        s.order.forEachIndexed { i, part ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("${i + 1}. ${part.label}", Modifier.weight(1f))
+                TextButton(onClick = {
+                    val l = s.order.toMutableList()
+                    if (i > 0) { Collections.swap(l, i, i - 1); s = s.copy(order = l) }
+                }) { Text("▲") }
+                TextButton(onClick = {
+                    val l = s.order.toMutableList()
+                    if (i < l.size - 1) { Collections.swap(l, i, i + 1); s = s.copy(order = l) }
+                }) { Text("▼") }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text("Розділювач", style = MaterialTheme.typography.titleMedium)
+        Row(Modifier.horizontalScroll(rememberScrollState())) {
+            listOf("Тире" to " - ", "Пробіл" to " ", "Крапка" to ". ", "Підкреслення" to "_").forEach { (label, value) ->
+                FilterChip(selected = s.sep == value, onClick = { s = s.copy(sep = value) }, label = { Text(label) })
+                Spacer(Modifier.width(6.dp))
+            }
+        }
+        OutlinedTextField(
+            value = s.sep,
+            onValueChange = { s = s.copy(sep = it) },
+            label = { Text("Свій розділювач") },
+            singleLine = true
+        )
+        }
+
+        Spacer(Modifier.height(12.dp))
+        visible.firstOrNull()?.let {
+            Text("Приклад:", style = MaterialTheme.typography.titleSmall)
+            Text(it.name, style = MaterialTheme.typography.bodySmall)
+            Text("→ ${newName(eff(it), s, onlineTitles[it.uri], origAuthors[it.uri])}", style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(12.dp))
+        }
+        Button(
+            enabled = visible.isNotEmpty() && !busy,
+            onClick = {
+                scope.launch {
+                    busy = true
+                    excluded = emptySet()
+                    var ai = mapOf<Uri, AiResult>()
+                    if (s.ai && apiKey.isNotBlank()) {
+                        status = "ШІ читає уривки книг..."
+                        ai = withContext(Dispatchers.IO) {
+                            val res = mutableMapOf<Uri, AiResult>()
+                            val todo = visible.filter {
+                                (titleIsBad(it) || it.meta.author.isNullOrBlank()) && it.ext in setOf("epub", "fb2")
+                            }
+                            todo.forEachIndexed { i, b ->
+                                tick("ШІ читає книги", i + 1, todo.size)
+                                val r = askClaude(apiKey, extractText(ctx, b.uri, b.ext), b.name)
+                                if (r != null) res[b.uri] = r
+                            }
+                            res
+                        }
+                    }
+                    aiResults = ai
+                    if (s.online || s.onlineAll) {
+                        status = "Шукаю назви в інтернеті..."
+                        onlineTitles = withContext(Dispatchers.IO) {
+                            val todo = visible.filter { (s.onlineAll || titleIsBad(it)) && !ai.containsKey(it.uri) }
+                            val res = mutableMapOf<Uri, String>()
+                            todo.forEachIndexed { i, b ->
+                                tick("Шукаю назви в інтернеті", i + 1, todo.size)
+                                lookupTitle(onlineQuery(b))?.let { res[b.uri] = it }
+                            }
+                            res
+                        }
+                    } else {
+                        onlineTitles = emptyMap()
+                    }
+                    if (s.origAuthor) {
+                        status = "Шукаю авторів мовою оригіналу..."
+                        origAuthors = withContext(Dispatchers.IO) {
+                            val names = visible.mapNotNull { eff(it).meta.author?.takeIf { a -> a.isNotBlank() } }.distinct()
+                            names.forEachIndexed { i, n ->
+                                tick("Шукаю авторів в інтернеті", i + 1, names.size)
+                                lookupOriginalAuthor(n)
+                            }
+                            visible.mapNotNull { b ->
+                                val a = eff(b).meta.author
+                                val o = if (a.isNullOrBlank()) null else authorCache[a.trim()]
+                                if (o != null) b.uri to o else null
+                            }.toMap()
+                        }
+                    } else {
+                        origAuthors = emptyMap()
+                    }
+                    status = "ШІ: ${ai.size}, назв з інтернету: ${onlineTitles.size}, авторів: ${origAuthors.size}"
+                    busy = false
+                    showPreview = true
+                }
+            }
+        ) { Text("Показати зміни (${plan.size})") }
+    }
+}
+
+
+// ---------- Розділ «Метадані» ----------
+
+@Composable
+fun BookEditor(book: Book, onBack: () -> Unit, onSaved: (Book) -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var title by remember(book.uri) { mutableStateOf(book.meta.title ?: "") }
+    var author by remember(book.uri) { mutableStateOf(book.meta.author ?: "") }
+    var series by remember(book.uri) { mutableStateOf(book.meta.series ?: "") }
+    var number by remember(book.uri) { mutableStateOf(book.meta.number ?: "") }
+    var info by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    val apiKey = ctx.getSharedPreferences("prefs", 0).getString("key", "") ?: ""
+
+    Column(Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(12.dp)) {
+        Text("Редагування метаданих", style = MaterialTheme.typography.titleLarge)
+        Text(book.name, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Назва") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(value = author, onValueChange = { author = it }, label = { Text("Автор") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(value = series, onValueChange = { series = it }, label = { Text("Серія") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(value = number, onValueChange = { number = it }, label = { Text("Номер у серії") }, modifier = Modifier.fillMaxWidth())
+
+        Spacer(Modifier.height(12.dp))
+        Button(
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth(),
+            onClick = {
+                scope.launch {
+                    busy = true
+                    info = "Шукаю в інтернеті..."
+                    val r = withContext(Dispatchers.IO) { lookupBook(fileQuery(book)) }
+                    if (r == null) {
+                        info = "Нічого не знайдено"
+                    } else {
+                        r.first?.let { title = it }
+                        r.second?.let { author = it }
+                        info = "Знайдено в інтернеті за назвою файлу, перевірте поля"
+                    }
+                    busy = false
+                }
+            }
+        ) { Text("Знайти в інтернеті за назвою файлу") }
+        OutlinedButton(
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth(),
+            onClick = {
+                if (apiKey.isBlank()) {
+                    info = "Спершу введіть API-ключ: Перейменовувач → Пошук назв → ШІ"
+                } else {
+                    scope.launch {
+                        busy = true
+                        info = "ШІ читає уривок книги..."
+                        val r = withContext(Dispatchers.IO) { askClaude(apiKey, extractText(ctx, book.uri, book.ext), book.name) }
+                        if (r == null) {
+                            info = "ШІ не впізнав книгу або помилка (перевірте ключ і баланс)"
+                        } else {
+                            r.title?.let { title = it }
+                            r.author?.let { author = it }
+                            r.series?.let { series = it }
+                            r.number?.let { number = it }
+                            info = "Визначено ШІ (${r.conf}), перевірте поля"
+                        }
+                        busy = false
+                    }
+                }
+            }
+        ) { Text("Визначити за допомогою ШІ") }
+        if (info.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Text(info, style = MaterialTheme.typography.bodyMedium)
+        }
+
+        if (busy) ProgressBlock(info.ifBlank { "Зачекайте..." }, null)
+        Spacer(Modifier.height(16.dp))
+        Row {
+            OutlinedButton(onClick = onBack) { Text("Назад") }
+            Spacer(Modifier.width(8.dp))
+            Button(
+                enabled = !busy,
+                onClick = {
+                    scope.launch {
+                        busy = true
+                        val nm = Meta(
+                            title.trim().ifBlank { null },
+                            author.trim().ifBlank { null },
+                            series.trim().ifBlank { null },
+                            number.trim().ifBlank { null }
+                        )
+                        val ok = withContext(Dispatchers.IO) { writeMeta(ctx, book, nm) }
+                        if (ok) {
+                            val nb = withContext(Dispatchers.IO) { loadBook(ctx, book.uri, book.name) }
+                            info = "Збережено у файл"
+                            if (nb != null) onSaved(nb)
+                        } else {
+                            info = "Не вдалося зберегти (файл недоступний для запису?)"
+                        }
+                        busy = false
+                    }
+                }
+            ) { Text("Зберегти в файл") }
+        }
+        Text(
+            "Порада: зробіть копію книг перед масовими змінами. Працює для EPUB і FB2.",
+            style = MaterialTheme.typography.labelSmall
+        )
+    }
+}
+
+@Composable
+fun MetadataScreen(onMenu: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var books by remember { mutableStateOf<List<Book>>(emptyList()) }
+    var recursive by remember { mutableStateOf(true) }
+    var onlyBad by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("Оберіть теку або файли (EPUB, FB2)") }
+    var editing by remember { mutableStateOf<Book?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var progress by remember { mutableStateOf<Float?>(null) }
+    var progressText by remember { mutableStateOf("") }
+
+    fun tick(text: String, i: Int, n: Int) {
+        progressText = "$text: $i / $n"
+        progress = if (n > 0) i.toFloat() / n else null
+    }
+
+    val pickFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) scope.launch {
+            busy = true
+            progress = null
+            progressText = "Шукаю файли..."
+            val files = withContext(Dispatchers.IO) { listFiles(ctx, uri, recursive) }
+            books = withContext(Dispatchers.IO) {
+                files.mapIndexedNotNull { i, f ->
+                    tick("Читаю книги", i + 1, files.size)
+                    loadBook(ctx, f.first, f.second)
+                }.filter { it.ext == "epub" || it.ext == "fb2" }
+            }
+            busy = false
+            status = "Знайдено книг: ${books.size}"
+        }
+    }
+    val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val d = r.data ?: return@rememberLauncherForActivityResult
+        val uris = mutableListOf<Uri>()
+        val clip = d.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+        } else {
+            d.data?.let { uris.add(it) }
+        }
+        scope.launch {
+            busy = true
+            progress = null
+            progressText = "Читаю книги..."
+            books = withContext(Dispatchers.IO) {
+                uris.mapIndexedNotNull { i, u ->
+                    tick("Читаю книги", i + 1, uris.size)
+                    loadBook(ctx, u, displayName(ctx, u))
+                }.filter { it.ext == "epub" || it.ext == "fb2" }
+            }
+            busy = false
+            status = "Вибрано книг: ${books.size}"
+        }
+    }
+
+    val cur = editing
+    if (cur != null) {
+        BookEditor(
+            book = cur,
+            onBack = { editing = null },
+            onSaved = { nb ->
+                books = books.map { if (it.uri == nb.uri) nb else it }
+                editing = nb
+            }
+        )
+        return
+    }
+
+    val visible = books.filter { !onlyBad || titleIsBad(it) || it.meta.author.isNullOrBlank() }
+
+    Column(Modifier.fillMaxSize().systemBarsPadding().padding(12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onMenu) { Text("☰", style = MaterialTheme.typography.titleLarge) }
+            Text("Метадані", style = MaterialTheme.typography.titleLarge)
+        }
+        Spacer(Modifier.height(8.dp))
+        Row {
+            Button(onClick = { pickFolder.launch(null) }) { Text("Обрати теку") }
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton(onClick = {
+                pickFiles.launch(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    type = "*/*"
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                })
+            }) { Text("Обрати файли") }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(checked = recursive, onCheckedChange = { recursive = it })
+            Spacer(Modifier.width(8.dp))
+            Text("Теки всередині теки")
+        }
+        Row {
+            FilterChip(selected = !onlyBad, onClick = { onlyBad = false }, label = { Text("Усі") })
+            Spacer(Modifier.width(6.dp))
+            FilterChip(selected = onlyBad, onClick = { onlyBad = true }, label = { Text("Без назви чи автора") })
+        }
+        Text("$status (показано: ${visible.size})", style = MaterialTheme.typography.bodySmall)
+        if (busy) ProgressBlock(progressText, progress)
+        Spacer(Modifier.height(4.dp))
+        LazyColumn(Modifier.weight(1f)) {
+            items(visible) { b ->
+                Column(Modifier.fillMaxWidth().clickable { editing = b }.padding(vertical = 8.dp)) {
+                    Text(b.name, style = MaterialTheme.typography.bodyMedium)
+                    val seriesText = listOfNotNull(b.meta.series, b.meta.number?.let { "№$it" }).joinToString(" ")
+                    Text(
+                        "Назва: ${b.meta.title ?: "—"}\nАвтор: ${b.meta.author ?: "—"}\nСерія: ${seriesText.ifBlank { "—" }}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                HorizontalDivider()
+            }
+        }
+    }
+}
+
+// ---------- Головна оболонка з меню-бургером ----------
+
+@Composable
+fun App() {
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    var screen by remember { mutableStateOf(0) }
+    val openMenu: () -> Unit = { scope.launch { drawerState.open() } }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                Text("Книги", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(20.dp))
+                NavigationDrawerItem(
+                    label = { Text("Перейменовувач") },
+                    selected = screen == 0,
+                    onClick = { screen = 0; scope.launch { drawerState.close() } },
+                    modifier = Modifier.padding(horizontal = 12.dp)
+                )
+                NavigationDrawerItem(
+                    label = { Text("Метадані") },
+                    selected = screen == 1,
+                    onClick = { screen = 1; scope.launch { drawerState.close() } },
+                    modifier = Modifier.padding(horizontal = 12.dp)
+                )
+            }
+        }
+    ) {
+        if (screen == 0) RenamerScreen(openMenu) else MetadataScreen(openMenu)
+    }
+}
