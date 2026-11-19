@@ -25,6 +25,11 @@ jobs:
 
       - name: Prepare project
         run: |
+          echo "Рядків у MainActivity.kt: $(wc -l < MainActivity.kt)"
+          if [ "$(tail -n 1 MainActivity.kt | tr -d '[:space:]')" != "}" ]; then
+            echo "ПОМИЛКА: файл MainActivity.kt обрізаний, не вистачає кінця. Завантажте його повністю."
+            exit 1
+          fi
           mkdir -p app/src/main/java/com/example/bookrenamer
           mv MainActivity.kt app/src/main/java/com/example/bookrenamer/MainActivity.kt
 
@@ -208,4 +213,3 @@ jobs:
         with:
           name: BookRenamer-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-          
